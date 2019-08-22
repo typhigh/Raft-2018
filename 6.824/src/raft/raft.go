@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	"fmt"
+	//	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -143,8 +143,8 @@ func (rf *Raft) updateToState(state int32) {
 		rf.heartbeaTimer.Reset(HeartbeatInterval)
 	}
 
-	stateName := []string{"FOLLOWER", "CANDIDATE", "LEADER"}
-	fmt.Printf("[msg]: raft %d oldState is %s and newState is %s.\n", rf.me, stateName[oldState], stateName[state])
+	// stateName := []string{"FOLLOWER", "CANDIDATE", "LEADER"}
+	// fmt.Printf("[msg]: raft %d oldState is %s and newState is %s.\n", rf.me, stateName[oldState], stateName[state])
 }
 
 //
@@ -290,6 +290,9 @@ type AppendEntriesReply struct {
 	// 2A
 	Term    int
 	Success bool
+
+	// 2B
+	PrevLogIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -302,7 +305,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Condition 1
+	// Step
 	reply.Success = false
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
@@ -316,14 +319,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 	}
 
-	// Condition 2
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].LogTerm != args.PrevLogTerm {
+	// Step 2
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
-		reply.Term = rf.currentTerm
+		reply.PrevLogIndex = len(rf.log) - 1
 		return
 	}
 
-	// Condition 3
+	if rf.log[args.PrevLogIndex].LogTerm != args.PrevLogTerm {
+		reply.Success = false
+		index := args.PrevLogIndex
+		for rf.log[index].LogTerm == rf.log[args.PrevLogIndex].LogTerm {
+			index--
+		}
+		reply.PrevLogIndex = index
+		return
+	}
+	// Step 3
+	conflicted := false
+	if len(rf.log) <= len(args.Entries)+args.PrevLogIndex {
+		conflicted = true
+	} else {
+		for i := 0; i < len(args.Entries); i++ {
+			if rf.log[args.PrevLogIndex+1+i].LogTerm != args.Entries[i].LogTerm {
+				conflicted = true
+				break
+			}
+		}
+	}
+
+	// Step 4
+	if conflicted {
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	}
+
+	// Step 5
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		go rf.applyCommit()
+	}
 }
 
 //
@@ -342,11 +376,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
+	term, isLeader := rf.GetState()
 
 	// Your code here (2B).
 
+	if isLeader {
+		index = rf.appendCommand(command)
+	}
 	return index, term, isLeader
 }
 
@@ -482,10 +518,34 @@ func (rf *Raft) boardcastHeartbeat() {
 			}
 			var reply AppendEntriesReply
 			if rf.state == STATE_LEADER && rf.sendAppendEntries(id, &args, &reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				if !reply.Success {
 					if rf.currentTerm < reply.Term {
 						rf.currentTerm = reply.Term
 						rf.updateToState(STATE_FOLLOWER)
+					} else {
+						rf.nextIndex[id] = reply.PrevLogIndex + 1
+					}
+				} else {
+					rf.matchIndex[id] = args.PrevLogIndex + len(args.Entries)
+					rf.nextIndex[id] = rf.matchIndex[id] + 1
+
+					// fmt.Printf("[msg] raft %d send heartbeat success\n", rf.me)
+					// Maybe we can update commitIndex
+					// TODO: binary search is better
+					for index := rf.getLastLogIndex(); index > rf.commitIndex; index-- {
+						count := 0
+						for i := range rf.peers {
+							if i == rf.me || rf.matchIndex[i] >= index {
+								count++
+							}
+						}
+						if count > len(rf.peers)/2 {
+							rf.commitIndex = index
+							go rf.applyCommit()
+							return
+						}
 					}
 				}
 			}
@@ -493,7 +553,57 @@ func (rf *Raft) boardcastHeartbeat() {
 	}
 }
 
+func (rf *Raft) appendCommand(command interface{}) int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	appendLogEntry := LogEntry{
+		Command:  command,
+		LogTerm:  rf.currentTerm,
+		LogIndex: rf.getLastLogIndex() + 1,
+	}
+	// fmt.Printf("[msg] raft %d append entry: Term %d Index %d\n", rf.me, appendLogEntry.LogTerm, appendLogEntry.LogIndex)
+	rf.log = append(rf.log, appendLogEntry)
+	return rf.getLastLogIndex()
+}
+
+func (rf *Raft) applyCommit() {
+	rf.mu.Lock()
+	if rf.commitIndex <= rf.lastApplied {
+		rf.mu.Unlock()
+		return
+	}
+	start := rf.lastApplied + 1
+	applyEntries := rf.log[start:]
+	rf.mu.Unlock()
+	for _, entry := range applyEntries {
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      entry.Command,
+			CommandIndex: entry.LogIndex,
+		}
+		// fmt.Printf("[msg] raft %d apply index %d\n", rf.me, msg.CommandIndex)
+		rf.applyCh <- msg
+		rf.mu.Lock()
+		rf.lastApplied = msg.CommandIndex
+		rf.mu.Unlock()
+	}
+}
 func randTimeDuration(lower, upper time.Duration) time.Duration {
 	num := rand.Int63n(upper.Nanoseconds()-lower.Nanoseconds()) + lower.Nanoseconds()
 	return time.Duration(num) * time.Nanosecond
+}
+
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
