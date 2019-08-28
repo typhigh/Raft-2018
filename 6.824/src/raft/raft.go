@@ -508,6 +508,7 @@ func (rf *Raft) boardcastHeartbeat() {
 
 		go func(id int) {
 			prevLogIndex := rf.nextIndex[id] - 1
+			// entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderID:     rf.me,
@@ -564,7 +565,7 @@ func (rf *Raft) appendCommand(command interface{}) int {
 	}
 	// fmt.Printf("[msg] raft %d append entry: Term %d Index %d\n", rf.me, appendLogEntry.LogTerm, appendLogEntry.LogIndex)
 	rf.log = append(rf.log, appendLogEntry)
-	return rf.getLastLogIndex()
+	return appendLogEntry.LogIndex
 }
 
 func (rf *Raft) applyCommit() {
