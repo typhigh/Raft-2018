@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	//	"fmt"
+	// "fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -58,9 +58,9 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Command  interface{}
-	LogTerm  int
-	LogIndex int
+	Command interface{}
+	LogTerm int
+	// LogIndex int
 }
 
 //
@@ -106,7 +106,8 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) getLastLogIndex() int {
-	return rf.log[len(rf.log)-1].LogIndex
+	return len(rf.log) - 1
+	// return rf.log[len(rf.log)-1].LogIndex
 }
 
 func (rf *Raft) getLastLogTerm() int {
@@ -126,7 +127,6 @@ func (rf *Raft) updateToState(state int32) {
 		// No possible leader to candidate
 		// No need to reset electionTimer
 		rf.startElection()
-		rf.heartbeaTimer.Stop()
 
 	case STATE_FOLLOWER:
 		rf.heartbeaTimer.Stop()
@@ -137,7 +137,7 @@ func (rf *Raft) updateToState(state int32) {
 		rf.electionTimer.Stop()
 		for i := range rf.peers {
 			rf.matchIndex[i] = 0
-			rf.nextIndex[i] = 1
+			rf.nextIndex[i] = len(rf.log)
 		}
 		rf.boardcastHeartbeat()
 		rf.heartbeaTimer.Reset(HeartbeatInterval)
@@ -233,6 +233,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.voteFor = args.CandidateID
 		}
 	}
+	if reply.VoteGranted {
+		rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
+	}
 }
 
 //
@@ -296,12 +299,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	end := func() {
-		if reply.Success == true {
-			rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
-		}
-	}
-	defer end()
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -319,6 +317,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 	}
 
+	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
+
 	// Step 2
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
@@ -335,28 +335,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.PrevLogIndex = index
 		return
 	}
-	// Step 3
-	conflicted := false
+	// Step 3-4
 	if len(rf.log) <= len(args.Entries)+args.PrevLogIndex {
-		conflicted = true
+		rf.log = rf.log[:args.PrevLogIndex+1]
+		rf.log = append(rf.log, args.Entries...)
 	} else {
 		for i := 0; i < len(args.Entries); i++ {
 			if rf.log[args.PrevLogIndex+1+i].LogTerm != args.Entries[i].LogTerm {
-				conflicted = true
+				rf.log = rf.log[:args.PrevLogIndex+1+i]
+				rf.log = append(rf.log, args.Entries[i:]...)
 				break
 			}
 		}
 	}
 
-	// Step 4
-	if conflicted {
-		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-	}
-
 	// Step 5
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
-		go rf.applyCommit()
+		lastIndex := len(rf.log) - 1
+		rf.commitIndex = min(args.LeaderCommit, lastIndex)
+		rf.applyCommit()
 	}
 }
 
@@ -478,21 +475,24 @@ func (rf *Raft) startElection() {
 	var voteNum int32
 	for i := range rf.peers {
 		if i == rf.me {
+			rf.voteFor = rf.me
 			atomic.AddInt32(&voteNum, 1)
 			continue
 		}
 		go func(id int) {
 			var reply RequestVoteReply
 			if rf.state == STATE_CANDIDATE && rf.sendRequestVote(id, &args, &reply) {
-				if reply.VoteGranted == true && rf.state == STATE_CANDIDATE {
+				rf.mu.Lock()
+				if reply.VoteGranted && rf.state == STATE_CANDIDATE {
 					atomic.AddInt32(&voteNum, 1)
-					if int(voteNum) > len(rf.peers)/2 {
+					if atomic.LoadInt32(&voteNum) > int32(len(rf.peers)/2) {
 						rf.updateToState(STATE_LEADER)
 					}
-				} else if reply.VoteGranted == false && rf.currentTerm < reply.Term {
+				} else if rf.currentTerm < reply.Term {
 					rf.currentTerm = reply.Term
 					rf.updateToState(STATE_FOLLOWER)
 				}
+				rf.mu.Unlock()
 			}
 		}(i)
 	}
@@ -507,20 +507,30 @@ func (rf *Raft) boardcastHeartbeat() {
 		}
 
 		go func(id int) {
+			rf.mu.Lock()
+			if rf.state != STATE_LEADER {
+				rf.mu.Unlock()
+				return
+			}
+
 			prevLogIndex := rf.nextIndex[id] - 1
-			// entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+			entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+			for i := range entries {
+				entries[i] = rf.log[prevLogIndex+1+i]
+			}
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderID:     rf.me,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  rf.log[prevLogIndex].LogTerm,
-				Entries:      rf.log[rf.nextIndex[id]:],
+				Entries:      entries,
 				LeaderCommit: rf.commitIndex,
 			}
+			rf.mu.Unlock()
+
 			var reply AppendEntriesReply
 			if rf.state == STATE_LEADER && rf.sendAppendEntries(id, &args, &reply) {
 				rf.mu.Lock()
-				defer rf.mu.Unlock()
 				if !reply.Success {
 					if rf.currentTerm < reply.Term {
 						rf.currentTerm = reply.Term
@@ -544,11 +554,12 @@ func (rf *Raft) boardcastHeartbeat() {
 						}
 						if count > len(rf.peers)/2 {
 							rf.commitIndex = index
-							go rf.applyCommit()
-							return
+							rf.applyCommit()
+							break
 						}
 					}
 				}
+				rf.mu.Unlock()
 			}
 		}(i)
 	}
@@ -558,38 +569,36 @@ func (rf *Raft) appendCommand(command interface{}) int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	index := len(rf.log)
 	appendLogEntry := LogEntry{
-		Command:  command,
-		LogTerm:  rf.currentTerm,
-		LogIndex: rf.getLastLogIndex() + 1,
+		Command: command,
+		LogTerm: rf.currentTerm,
+		// LogIndex: rf.getLastLogIndex() + 1,
 	}
 	// fmt.Printf("[msg] raft %d append entry: Term %d Index %d\n", rf.me, appendLogEntry.LogTerm, appendLogEntry.LogIndex)
 	rf.log = append(rf.log, appendLogEntry)
-	return appendLogEntry.LogIndex
+	return index
 }
 
 func (rf *Raft) applyCommit() {
-	rf.mu.Lock()
 	if rf.commitIndex <= rf.lastApplied {
-		rf.mu.Unlock()
 		return
 	}
-	start := rf.lastApplied + 1
-	applyEntries := rf.log[start:]
-	rf.mu.Unlock()
-	for _, entry := range applyEntries {
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      entry.Command,
-			CommandIndex: entry.LogIndex,
+
+	go func(start_idx int, entries []LogEntry) {
+		for idx, entry := range entries {
+			var msg ApplyMsg
+			msg.CommandValid = true
+			msg.Command = entry.Command
+			msg.CommandIndex = start_idx + idx
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			rf.lastApplied = msg.CommandIndex
+			rf.mu.Unlock()
 		}
-		// fmt.Printf("[msg] raft %d apply index %d\n", rf.me, msg.CommandIndex)
-		rf.applyCh <- msg
-		rf.mu.Lock()
-		rf.lastApplied = msg.CommandIndex
-		rf.mu.Unlock()
-	}
+	}(rf.lastApplied+1, rf.log[rf.lastApplied+1:rf.commitIndex+1])
 }
+
 func randTimeDuration(lower, upper time.Duration) time.Duration {
 	num := rand.Int63n(upper.Nanoseconds()-lower.Nanoseconds()) + lower.Nanoseconds()
 	return time.Duration(num) * time.Nanosecond
