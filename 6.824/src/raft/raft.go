@@ -301,7 +301,8 @@ type AppendEntriesReply struct {
 	Success bool
 
 	// 2B
-	PrevLogIndex int
+	NextLogIndex int
+	NextTerm     int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -328,7 +329,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Step 2
 	if args.PrevLogIndex+1 > len(rf.log) {
 		reply.Success = false
-		reply.PrevLogIndex = len(rf.log)
+		reply.NextLogIndex = len(rf.log)
+		reply.NextTerm = -1
 		return
 	}
 
@@ -338,7 +340,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for rf.log[index-1].Term == rf.log[args.PrevLogIndex].Term {
 			index--
 		}
-		reply.PrevLogIndex = index
+		reply.NextLogIndex = index
+		reply.NextTerm = rf.log[index].Term
 		return
 	}
 	// Step 3-4
@@ -544,7 +547,16 @@ func (rf *Raft) boardcastHeartbeat() {
 						rf.currentTerm = reply.Term
 						rf.updateToState(STATE_FOLLOWER)
 					} else {
-						rf.nextIndex[id] = reply.PrevLogIndex
+						rf.nextIndex[id] = reply.NextLogIndex
+
+						if reply.NextTerm != -1 {
+							for index := rf.nextIndex[id]; index > rf.matchIndex[id]; index-- {
+								if reply.NextTerm != rf.log[index].Term {
+									rf.nextIndex[id] = index
+									break
+								}
+							}
+						}
 					}
 				} else {
 					rf.matchIndex[id] = args.PrevLogIndex + len(args.Entries)
