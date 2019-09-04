@@ -17,12 +17,17 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "fmt"
+import (
+	//"golang.org/x/tools/cmd/getgo/server"
+	"bytes"
+	"fmt"
+	"labgob"
+	"labrpc"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
@@ -165,6 +170,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -187,6 +199,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		DPrintf("%v fails to recover from persist", rf)
+		return
+	}
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.logs = logs
 }
 
 //
@@ -218,6 +244,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	// Your code here (2A, 2B).
 	if args.Term < rf.currentTerm ||
 		(args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
@@ -263,11 +290,15 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 2A
 	Success bool // 2A
+
+	NextLogIndex int // 2C
+	NextLogTerm  int // 2C
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -286,40 +317,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// entries before args.PrevLogIndex might be unmatch
 	// return false and ask Leader to decrement PrevLogIndex
-	if len(rf.logs) < args.PrevLogIndex+1 ||
-		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.logs) < args.PrevLogIndex+1 {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.NextLogTerm = -1
+		reply.NextLogIndex = len(rf.logs)
+		return
+	}
+
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		reply.NextLogTerm = rf.logs[args.PrevLogIndex].Term
+		index := args.PrevLogIndex
+		for rf.logs[index-1].Term == reply.NextLogTerm {
+			index--
+		}
+		reply.NextLogIndex = index
 		return
 	}
 
 	// compare from rf.logs[args.PrevLogIndex + 1]
-	unmatch_idx := -1
 	for idx := range args.LogEntries {
-		if len(rf.logs) < args.PrevLogIndex+2+idx ||
+		if len(rf.logs) <= args.PrevLogIndex+1+idx ||
 			rf.logs[args.PrevLogIndex+1+idx].Term != args.LogEntries[idx].Term {
 			// unmatch log found
-			unmatch_idx = idx
+			rf.logs = rf.logs[:args.PrevLogIndex+1+idx]
+			rf.logs = append(rf.logs, args.LogEntries[idx:]...)
 			break
 		}
-	}
-
-	if unmatch_idx != -1 {
-		// there are unmatch entries
-		// truncate unmatch Follower entries, and apply Leader entries
-		rf.logs = rf.logs[:args.PrevLogIndex+1+unmatch_idx]
-		rf.logs = append(rf.logs, args.LogEntries[unmatch_idx:]...)
 	}
 
 	// Leader guarantee to have all committed entries
 	// TODO: Is that possible for lastLogIndex < args.LeaderCommit?
 	if args.LeaderCommit > rf.commitIndex {
 		lastLogIndex := len(rf.logs) - 1
-		if args.LeaderCommit <= lastLogIndex {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = lastLogIndex
-		}
+		rf.commitIndex = min(args.LeaderCommit, lastLogIndex)
 		rf.apply()
 	}
 
@@ -330,6 +363,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) apply() {
 	// apply all entries between lastApplied and committed
 	// should be called after commitIndex updated
+	// rf.commitIndex = commitIndex
+
 	if rf.commitIndex > rf.lastApplied {
 		go func(start_idx int, entries []LogEntry) {
 			for idx, entry := range entries {
@@ -363,12 +398,14 @@ func (rf *Raft) broadcastHeartbeat() {
 			}
 
 			prevLogIndex := rf.nextIndex[server] - 1
+			entries := make([]LogEntry, len(rf.logs[prevLogIndex+1:]))
+			copy(entries, rf.logs[prevLogIndex+1:])
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  rf.logs[prevLogIndex].Term,
-				LogEntries:   rf.logs[rf.nextIndex[server]:],
+				LogEntries:   entries,
 				LeaderCommit: rf.commitIndex,
 			}
 			rf.mu.Unlock()
@@ -403,9 +440,19 @@ func (rf *Raft) broadcastHeartbeat() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.convertTo(Follower)
+						rf.persist()
 					} else {
 						// log unmatch
-						rf.nextIndex[server] -= 1
+						rf.nextIndex[server] = reply.NextLogIndex
+
+						if reply.NextLogTerm != -1 {
+							for i := args.PrevLogIndex; i >= 1; i-- {
+								if rf.logs[i-1].Term == reply.NextLogTerm {
+									rf.nextIndex[server] = i
+									break
+								}
+							}
+						}
 						// TODO: retry now or later?
 					}
 				}
@@ -417,6 +464,7 @@ func (rf *Raft) broadcastHeartbeat() {
 
 // should be called with lock
 func (rf *Raft) startElection() {
+	defer rf.persist()
 	rf.currentTerm += 1
 	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 
@@ -451,6 +499,7 @@ func (rf *Raft) startElection() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.convertTo(Follower)
+						rf.persist()
 					}
 				}
 				rf.mu.Unlock()
@@ -526,6 +575,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		DPrintf("%v start agreement on command %d on index %d", rf, command.(int), index)
+		rf.persist()
 		rf.mu.Unlock()
 	}
 
@@ -601,12 +651,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}(rf)
 
 	// initialize from state persisted before a crash
+	rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
-
+	rf.mu.Unlock()
 	return rf
 }
 
 func randTimeDuration(lower, upper time.Duration) time.Duration {
 	num := rand.Int63n(upper.Nanoseconds()-lower.Nanoseconds()) + lower.Nanoseconds()
 	return time.Duration(num) * time.Nanosecond
+}
+
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
